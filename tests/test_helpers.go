@@ -1,0 +1,102 @@
+package tests
+
+import (
+	"fmt"
+	"math/rand"
+	"sort"
+	"testing"
+	"time"
+
+	gridkv "github.com/feellmoose/gridkv"
+	"github.com/feellmoose/gridkv/internal/gossip"
+)
+
+// Shared test helper functions
+
+func randomValue(n int) []byte {
+	b := make([]byte, n)
+	rand.Read(b)
+	return b
+}
+
+func calculatePercentiles(latencies []time.Duration) (p50, p95, p99 time.Duration) {
+	n := len(latencies)
+	if n == 0 {
+		return 0, 0, 0
+	}
+
+	sort.Slice(latencies, func(i, j int) bool {
+		return latencies[i] < latencies[j]
+	})
+
+	p50 = latencies[n*50/100]
+	p95 = latencies[n*95/100]
+	p99 = latencies[n*99/100]
+	return
+}
+
+func setupTestCluster(tb testing.TB, nodeCount, basePort int) []*gridkv.GridKV {
+	nodes := make([]*gridkv.GridKV, nodeCount)
+
+	// Create seed node
+	var err error
+	nodes[0], err = gridkv.NewGridKV(&gridkv.GridKVOptions{
+		LocalNodeID:  "node-0",
+		LocalAddress: fmt.Sprintf("localhost:%d", basePort),
+		Network: &gossip.NetworkOptions{
+			Type:     gossip.TCP,
+			BindAddr: fmt.Sprintf("localhost:%d", basePort),
+		},
+		Storage: &gossip.StorageOptions{
+			Backend:     gossip.Memory,
+			MaxMemoryMB: 512,
+		},
+		ReplicaCount: minInt(3, nodeCount),
+		WriteQuorum:  minInt(2, nodeCount),
+		ReadQuorum:   minInt(2, nodeCount),
+	})
+	if err != nil {
+		tb.Fatalf("Failed to create seed node: %v", err)
+	}
+
+	// Create remaining nodes
+	seedAddr := []string{fmt.Sprintf("localhost:%d", basePort)}
+	for i := 1; i < nodeCount; i++ {
+		nodes[i], err = gridkv.NewGridKV(&gridkv.GridKVOptions{
+			LocalNodeID:  fmt.Sprintf("node-%d", i),
+			LocalAddress: fmt.Sprintf("localhost:%d", basePort+i),
+			SeedAddrs:    seedAddr,
+			Network: &gossip.NetworkOptions{
+				Type:     gossip.TCP,
+				BindAddr: fmt.Sprintf("localhost:%d", basePort+i),
+			},
+			Storage: &gossip.StorageOptions{
+				Backend:     gossip.Memory,
+				MaxMemoryMB: 512,
+			},
+			ReplicaCount: minInt(3, nodeCount),
+			WriteQuorum:  minInt(2, nodeCount),
+			ReadQuorum:   minInt(2, nodeCount),
+		})
+		if err != nil {
+			tb.Fatalf("Failed to create node %d: %v", i, err)
+		}
+	}
+
+	return nodes
+}
+
+func cleanupTestCluster(nodes []*gridkv.GridKV) {
+	for _, node := range nodes {
+		if node != nil {
+			node.Close()
+		}
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
