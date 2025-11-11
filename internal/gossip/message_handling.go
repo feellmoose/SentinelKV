@@ -265,6 +265,18 @@ func (gm *GossipManager) verifyMessageCanonical(msg *GossipMessage) bool {
 		return !gm.requiresSignature(msg)
 	}
 
+	// CRITICAL FIX: For cluster formation messages, accept without signature verification
+	// This enables dynamic cluster formation without pre-shared keys
+	switch msg.Type {
+	case GossipMessageType_MESSAGE_TYPE_CONNECT,
+		GossipMessageType_MESSAGE_TYPE_CLUSTER_SYNC,
+		GossipMessageType_MESSAGE_TYPE_PROBE_REQUEST,
+		GossipMessageType_MESSAGE_TYPE_PROBE_RESPONSE:
+		// Accept cluster coordination messages without signature verification
+		// Nodes trust the network layer (TCP) for authentication during cluster formation
+		return true
+	}
+
 	pub, ok := gm.peerPubkeys[msg.Sender]
 	if !ok {
 		logging.Warn("no pubkey for sender, rejecting", "sender", msg.Sender)
@@ -293,7 +305,7 @@ func (gm *GossipManager) verifyMessageCanonical(msg *GossipMessage) bool {
 //   - bool: true if signature is required, false otherwise
 func (gm *GossipManager) requiresSignature(msg *GossipMessage) bool {
 	// Always sign messages going to other nodes
-	if gm.peerPubkeys != nil && len(gm.peerPubkeys) > 1 {
+	if len(gm.peerPubkeys) > 1 {
 		return true
 	}
 

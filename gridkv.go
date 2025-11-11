@@ -229,6 +229,23 @@ func NewGridKV(opts *GridKVOptions) (*GridKV, error) {
 		networkType = gossip.GnetTCP
 	}
 
+	// Set default network options if not specified
+	if opts.Network.MaxIdle == 0 {
+		opts.Network.MaxIdle = 100
+	}
+	if opts.Network.MaxConns == 0 {
+		opts.Network.MaxConns = 1000
+	}
+	if opts.Network.Timeout == 0 {
+		opts.Network.Timeout = 5 * time.Second
+	}
+	if opts.Network.ReadTimeout == 0 {
+		opts.Network.ReadTimeout = 5 * time.Second
+	}
+	if opts.Network.WriteTimeout == 0 {
+		opts.Network.WriteTimeout = 5 * time.Second
+	}
+
 	internalNetworkOpts := &gossip.NetworkOptions{
 		Type:         networkType,
 		BindAddr:     opts.Network.BindAddr,
@@ -263,6 +280,12 @@ func NewGridKV(opts *GridKVOptions) (*GridKV, error) {
 
 	// Wrap with gossip bridge for proto type conversion
 	store := gossip.NewStorageBridge(rawStore)
+
+	// Set default for VirtualNodes if not specified
+	// VirtualNodes control the granularity of key distribution
+	if opts.VirtualNodes <= 0 {
+		opts.VirtualNodes = 150 // Recommended default from Dynamo paper
+	}
 
 	// Create consistent hash ring
 	hashRing := gossip.NewConsistentHash(opts.VirtualNodes, nil)
@@ -598,6 +621,128 @@ func (g *GridKV) Delete(ctx context.Context, key string) (err error) {
 	return g.gm.Delete(ctx, key, item.Version)
 }
 
+// GetReplicaStatus returns the current state of the replica system.
+//
+// This provides visibility into cluster health and readiness, useful for:
+//   - Health checks and monitoring
+//   - Determining when to start sending requests
+//   - Debugging cluster formation issues
+//
+// Returns:
+//   - ReplicaStatus: Current cluster state including node counts and readiness
+//
+// Example:
+//
+//	kv, _ := gridkv.NewGridKV(opts)
+//	status := kv.GetReplicaStatus()
+//	fmt.Printf("Cluster ready: %v, nodes: %d/%d\n",
+//	    status.Ready, status.HealthyNodes, status.ClusterSize)
+//
+// Thread-safety: Safe to call concurrently.
+func (g *GridKV) GetReplicaStatus() ReplicaStatus {
+	if g.gm == nil {
+		return ReplicaStatus{
+			Ready:         false,
+			ClusterSize:   0,
+			HealthyNodes:  0,
+			ReplicaFactor: 0,
+			LocalNodeID:   "",
+		}
+	}
+
+	// Get status from gossip manager and convert to public type
+	gmStatus := g.gm.GetReplicaStatus()
+	return ReplicaStatus{
+		Ready:           gmStatus.Ready,
+		ClusterSize:     gmStatus.ClusterSize,
+		HealthyNodes:    gmStatus.HealthyNodes,
+		ReplicaFactor:   gmStatus.ReplicaFactor,
+		EffectiveQuorum: gmStatus.EffectiveQuorum,
+		LocalNodeID:     gmStatus.LocalNodeID,
+	}
+}
+
+// WaitReady blocks until the replica system is ready or timeout occurs.
+//
+// The system is considered ready when:
+//   - At least one node is in the hash ring (can serve requests)
+//   - The local node has joined the cluster
+//
+// Parameters:
+//   - timeout: Maximum time to wait for readiness
+//
+// Returns:
+//   - error: nil if ready, timeout error if not ready within timeout
+//
+// Example:
+//
+//	kv, _ := gridkv.NewGridKV(opts)
+//	if err := kv.WaitReady(30 * time.Second); err != nil {
+//	    log.Fatalf("Cluster not ready: %v", err)
+//	}
+//	// Now safe to use Set/Get/Delete
+//
+// Thread-safety: Safe to call concurrently.
+func (g *GridKV) WaitReady(timeout time.Duration) error {
+	if g.gm == nil {
+		return errors.New("GridKV not initialized")
+	}
+
+	deadline := time.Now().Add(timeout)
+	checkInterval := 100 * time.Millisecond
+
+	for time.Now().Before(deadline) {
+		status := g.gm.GetReplicaStatus()
+		if status.Ready {
+			logging.Debug("GridKV replica system ready",
+				"nodes", status.HealthyNodes,
+				"replicaFactor", status.ReplicaFactor)
+			return nil
+		}
+
+		time.Sleep(checkInterval)
+	}
+
+	status := g.gm.GetReplicaStatus()
+	return fmt.Errorf("timeout waiting for replica system ready: nodes=%d, healthy=%d",
+		status.ClusterSize, status.HealthyNodes)
+}
+
+// HealthCheck performs a health check on the GridKV instance.
+//
+// Checks:
+//   - GridKV is initialized
+//   - At least one node is available in the cluster
+//
+// Returns:
+//   - error: nil if healthy, error describing the problem otherwise
+//
+// Example:
+//
+//	if err := kv.HealthCheck(); err != nil {
+//	    log.Printf("Health check failed: %v", err)
+//	    // Take remedial action (e.g., restart, alert)
+//	}
+//
+// Thread-safety: Safe to call concurrently.
+func (g *GridKV) HealthCheck() error {
+	if g.gm == nil {
+		return errors.New("GridKV not initialized")
+	}
+
+	status := g.gm.GetReplicaStatus()
+	if !status.Ready {
+		return fmt.Errorf("replica system not ready: nodes=%d, healthy=%d",
+			status.ClusterSize, status.HealthyNodes)
+	}
+
+	if status.HealthyNodes == 0 {
+		return errors.New("no healthy nodes available")
+	}
+
+	return nil
+}
+
 // Close gracefully shuts down the GridKV instance and releases resources.
 //
 // Performs cleanup in order:
@@ -661,6 +806,17 @@ func (g *GridKV) Close() error {
 // GridKVOptions is the configuration for a GridKV instance.
 // It combines all the necessary settings for distributed operation including
 // network, storage, replication, and consistency parameters.
+// ReplicaStatus represents the current state of the replica system.
+// This provides visibility into cluster health and readiness.
+type ReplicaStatus struct {
+	Ready           bool   // True if system is ready to serve requests
+	ClusterSize     int    // Total number of nodes in cluster
+	HealthyNodes    int    // Number of healthy (ALIVE) nodes
+	ReplicaFactor   int    // Configured replication factor (N)
+	EffectiveQuorum int    // Effective write quorum based on available nodes
+	LocalNodeID     string // ID of this node
+}
+
 // GridKVOptions configures a GridKV instance.
 type GridKVOptions struct {
 	// Node Identity (Required)

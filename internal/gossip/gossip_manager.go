@@ -65,6 +65,7 @@ type GossipManager struct {
 	mu           sync.RWMutex
 	localNodeID  string
 	localAddress string
+	seedAddrs    []string             // Bootstrap seed addresses
 	liveNodes    map[string]*NodeInfo // Active cluster members
 
 	hashRing *ConsistentHash // Consistent hash ring for data distribution
@@ -173,6 +174,7 @@ func NewGossipManager(opts *GossipOptions, hashRing *ConsistentHash, network Net
 	gm := &GossipManager{
 		localNodeID:        opts.LocalNodeID,
 		localAddress:       opts.LocalAddress,
+		seedAddrs:          opts.SeedAddrs,
 		liveNodes:          make(map[string]*NodeInfo),
 		hashRing:           hashRing,
 		store:              store,
@@ -258,6 +260,10 @@ func (gm *GossipManager) Start() {
 	}
 	gm.signMessageCanonical(join)
 	gm.SimulateReceive(join)
+
+	// CRITICAL FIX: Connect to seed nodes on startup
+	// This ensures nodes discover each other and build the hash ring
+	go gm.connectToSeeds()
 }
 
 // Stop gracefully shuts down the GossipManager.
@@ -427,4 +433,138 @@ func (gm *GossipManager) getRandomPeerID(exclude string) string {
 	}
 
 	return ids[rand.Intn(len(ids))]
+}
+
+// connectToSeeds initiates connections to all seed nodes on startup.
+// This is critical for cluster formation and node discovery.
+//
+// The function sends CONNECT messages to all seed addresses to announce
+// this node's presence and trigger mutual discovery. It retries periodically
+// until at least one seed responds or the cluster is formed.
+func (gm *GossipManager) connectToSeeds() {
+	if len(gm.seedAddrs) == 0 {
+		logging.Debug("No seed nodes configured - running as standalone or first node")
+		return
+	}
+
+	// Prepare CONNECT message
+	connectMsg := &GossipMessage{
+		Type:   GossipMessageType_MESSAGE_TYPE_CONNECT,
+		Sender: gm.localNodeID,
+		Payload: &GossipMessage_ConnectPayload{
+			ConnectPayload: &ConnectPayload{
+				NodeId:  gm.localNodeID,
+				Address: gm.localAddress,
+				Version: gm.incrementLocalVersion(),
+				Hlc:     gm.hlc.Now(),
+			},
+		},
+	}
+	gm.signMessageCanonical(connectMsg)
+
+	// Retry connecting to seeds with exponential backoff
+	maxRetries := 10
+	retryDelay := 100 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if we've discovered any peers
+		gm.mu.RLock()
+		peerCount := len(gm.liveNodes) - 1 // Exclude self
+		gm.mu.RUnlock()
+
+		if peerCount > 0 {
+			logging.Debug("Successfully connected to cluster", "peers", peerCount)
+			return
+		}
+
+		// Try to connect to all seeds
+		logging.Debug("Connecting to seed nodes", "attempt", attempt+1, "seeds", len(gm.seedAddrs))
+		for _, seedAddr := range gm.seedAddrs {
+			// Skip if seed address is our own address
+			if seedAddr == gm.localAddress {
+				continue
+			}
+
+			// Send CONNECT message to seed
+			if err := gm.network.SendWithTimeout(seedAddr, connectMsg, 2*time.Second); err != nil {
+				logging.Debug("Failed to connect to seed", "seed", seedAddr, "error", err)
+			} else {
+				logging.Debug("Sent CONNECT to seed", "seed", seedAddr)
+			}
+		}
+
+		// Wait before retry with exponential backoff
+		time.Sleep(retryDelay)
+		retryDelay = retryDelay * 2
+		if retryDelay > 5*time.Second {
+			retryDelay = 5 * time.Second
+		}
+	}
+
+	// Check final peer count
+	gm.mu.RLock()
+	peerCount := len(gm.liveNodes) - 1
+	gm.mu.RUnlock()
+
+	if peerCount == 0 {
+		logging.Warn("Failed to connect to any seed nodes after retries - running as standalone node")
+	} else {
+		logging.Debug("Connected to cluster", "peers", peerCount)
+	}
+}
+
+// GetReplicaStatus returns the current state of the replica system.
+// This provides visibility into cluster health and formation status.
+//
+// Returns:
+//   - ReplicaStatus: Current cluster state
+func (gm *GossipManager) GetReplicaStatus() ReplicaStatus {
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
+
+	clusterSize := len(gm.liveNodes)
+	healthyNodes := 0
+
+	// Count healthy (ALIVE) nodes
+	for _, node := range gm.liveNodes {
+		if node.State == NodeState_NODE_STATE_ALIVE {
+			healthyNodes++
+		}
+	}
+
+	// Determine effective write quorum
+	effectiveQuorum := gm.writeQuorum
+	if healthyNodes < gm.writeQuorum {
+		effectiveQuorum = (healthyNodes / 2) + 1
+		if effectiveQuorum < 1 {
+			effectiveQuorum = 1
+		}
+	}
+
+	// System is ready if at least one node is available
+	ready := healthyNodes > 0
+
+	// DEBUG: Log hash ring members
+	ringMembers := gm.hashRing.Members()
+	logging.Debug("Hash ring members", "count", len(ringMembers), "members", ringMembers)
+
+	return ReplicaStatus{
+		Ready:           ready,
+		ClusterSize:     clusterSize,
+		HealthyNodes:    healthyNodes,
+		ReplicaFactor:   gm.replicaCount,
+		EffectiveQuorum: effectiveQuorum,
+		LocalNodeID:     gm.localNodeID,
+	}
+}
+
+// ReplicaStatus represents the current state of the replica system.
+// Defined here to avoid circular import with main package.
+type ReplicaStatus struct {
+	Ready           bool
+	ClusterSize     int
+	HealthyNodes    int
+	ReplicaFactor   int
+	EffectiveQuorum int
+	LocalNodeID     string
 }
