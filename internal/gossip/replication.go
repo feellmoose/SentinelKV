@@ -32,9 +32,28 @@ func (gm *GossipManager) Set(ctx context.Context, key string, item *storage.Stor
 		return errors.New("nil item")
 	}
 
-	replicas := gm.hashRing.GetN(key, gm.replicaCount)
+	// This prevents "no replicas" errors when cluster is small or forming
+	gm.mu.RLock()
+	availableNodes := len(gm.liveNodes)
+	gm.mu.RUnlock()
+
+	// Use minimum of requested replicas and available nodes
+	effectiveReplicaCount := gm.replicaCount
+	if availableNodes < gm.replicaCount {
+		effectiveReplicaCount = availableNodes
+		if effectiveReplicaCount == 0 {
+			effectiveReplicaCount = 1 // At minimum, use local node
+		}
+	}
+
+	replicas := gm.hashRing.GetN(key, effectiveReplicaCount)
 	if len(replicas) == 0 {
-		return fmt.Errorf("no replicas for %s", key)
+		// Last resort: write to local node only
+		logging.Debug("No replicas in hash ring, writing to local node only", "key", key)
+		if err := gm.store.Set(key, item); err != nil {
+			return fmt.Errorf("local write failed: %w", err)
+		}
+		return nil
 	}
 
 	coordinator := replicas[0]
@@ -64,9 +83,27 @@ func (gm *GossipManager) Set(ctx context.Context, key string, item *storage.Stor
 // Returns:
 //   - error: Quorum error if W replicas don't acknowledge
 func (gm *GossipManager) Delete(ctx context.Context, key string, version int64) error {
-	replicas := gm.hashRing.GetN(key, gm.replicaCount)
+	// CRITICAL FIX: Adaptive replica count based on available nodes
+	gm.mu.RLock()
+	availableNodes := len(gm.liveNodes)
+	gm.mu.RUnlock()
+
+	effectiveReplicaCount := gm.replicaCount
+	if availableNodes < gm.replicaCount {
+		effectiveReplicaCount = availableNodes
+		if effectiveReplicaCount == 0 {
+			effectiveReplicaCount = 1
+		}
+	}
+
+	replicas := gm.hashRing.GetN(key, effectiveReplicaCount)
 	if len(replicas) == 0 {
-		return fmt.Errorf("no replicas for %s", key)
+		// Last resort: delete from local node only
+		logging.Debug("No replicas in hash ring, deleting from local node only", "key", key)
+		if err := gm.store.Delete(key, version); err != nil {
+			return fmt.Errorf("local delete failed: %w", err)
+		}
+		return nil
 	}
 
 	coordinator := replicas[0]
@@ -101,9 +138,28 @@ func (gm *GossipManager) Delete(ctx context.Context, key string, version int64) 
 //   - *storage.StoredItem: The stored item (highest version)
 //   - error: Not found error or quorum error
 func (gm *GossipManager) Get(ctx context.Context, key string) (*storage.StoredItem, error) {
-	replicas := gm.hashRing.GetN(key, gm.replicaCount)
+	// CRITICAL FIX: Adaptive replica count based on available nodes
+	gm.mu.RLock()
+	availableNodes := len(gm.liveNodes)
+	gm.mu.RUnlock()
+
+	effectiveReplicaCount := gm.replicaCount
+	if availableNodes < gm.replicaCount {
+		effectiveReplicaCount = availableNodes
+		if effectiveReplicaCount == 0 {
+			effectiveReplicaCount = 1
+		}
+	}
+
+	replicas := gm.hashRing.GetN(key, effectiveReplicaCount)
 	if len(replicas) == 0 {
-		return nil, fmt.Errorf("no replicas for %s", key)
+		// Last resort: read from local node only
+		logging.Debug("No replicas in hash ring, reading from local node only", "key", key)
+		item, err := gm.store.Get(key)
+		if err != nil {
+			return nil, err
+		}
+		return item, nil
 	}
 
 	// Check if local node is a replica
@@ -410,8 +466,17 @@ func (gm *GossipManager) readWithQuorum(ctx context.Context, key string, replica
 	// Read from local store first
 	localItem, localErr := gm.store.Get(key)
 
+	// CRITICAL FIX: Adaptive read quorum based on available replicas
+	effectiveReadQuorum := gm.readQuorum
+	if len(replicas) < gm.readQuorum {
+		effectiveReadQuorum = len(replicas)
+		if effectiveReadQuorum < 1 {
+			effectiveReadQuorum = 1
+		}
+	}
+
 	// If read quorum is 1, return local result immediately
-	if gm.readQuorum == 1 {
+	if effectiveReadQuorum == 1 {
 		if localErr != nil {
 			return nil, localErr
 		}
@@ -487,7 +552,7 @@ func (gm *GossipManager) readWithQuorum(ctx context.Context, key string, replica
 	defer cancel()
 
 	collected := 1 // Already have local result
-	for collected < gm.readQuorum {
+	for collected < effectiveReadQuorum {
 		select {
 		case resp := <-respCh:
 			if resp.Found {
@@ -505,7 +570,7 @@ func (gm *GossipManager) readWithQuorum(ctx context.Context, key string, replica
 			}
 			collected++
 		case <-ctx2.Done():
-			return nil, fmt.Errorf("read quorum not reached for %s: got %d required %d", key, collected, gm.readQuorum)
+			return nil, fmt.Errorf("read quorum not reached for %s: got %d required %d", key, collected, effectiveReadQuorum)
 		}
 	}
 

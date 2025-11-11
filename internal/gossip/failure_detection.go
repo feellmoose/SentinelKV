@@ -53,15 +53,19 @@ func (gm *GossipManager) updateNode(nodeID, address string, newState NodeState, 
 
 	// Handle existing node state transition
 	if version >= existing.Version {
-		if newState == NodeState_NODE_STATE_DEAD && existing.State != NodeState_NODE_STATE_DEAD {
-			remove = true
-		}
-		if newState == NodeState_NODE_STATE_ALIVE && existing.State != NodeState_NODE_STATE_ALIVE && nodeID != gm.localNodeID {
-			add = true
-		}
+		oldState := existing.State
 		existing.State = newState
+		existing.Address = address // Update address in case it changed
 		existing.LastActiveTs = now
 		existing.Version = version
+
+		// Determine hash ring changes
+		if newState == NodeState_NODE_STATE_DEAD && oldState != NodeState_NODE_STATE_DEAD {
+			remove = true
+		}
+		if newState == NodeState_NODE_STATE_ALIVE && oldState != NodeState_NODE_STATE_ALIVE && nodeID != gm.localNodeID {
+			add = true
+		}
 	}
 	gm.mu.Unlock()
 
