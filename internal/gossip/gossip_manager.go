@@ -50,6 +50,7 @@ type GossipOptions struct {
 	MaxReplicators     int           // Max concurrent replication goroutines
 	ReplicationTimeout time.Duration // Timeout for replication operations
 	ReadTimeout        time.Duration // Timeout for read operations
+	DisableAuth        bool          // Disable message authentication (use with caution)
 }
 
 // GossipManager is the core component that manages cluster membership, failure detection,
@@ -96,6 +97,7 @@ type GossipManager struct {
 	// Cryptography
 	keypair     *crypto.KeyPair             // Local key pair for signing
 	peerPubkeys map[string]crypto.PublicKey // Peer public keys for verification
+	disableAuth bool                        // Disable message authentication
 
 	// Read operation tracking
 	pendingReads sync.Map // map[requestId]chan *ReadResponsePayload
@@ -195,6 +197,7 @@ func NewGossipManager(opts *GossipOptions, hashRing *ConsistentHash, network Net
 		opidGen:            opid.NewGenerator(opts.LocalNodeID),
 		keypair:            keypair,
 		peerPubkeys:        peerPubkeys,
+		disableAuth:        opts.DisableAuth,
 	}
 
 	// Add local node to liveNodes and hash ring
@@ -251,10 +254,11 @@ func (gm *GossipManager) Start() {
 		Sender: gm.localNodeID,
 		Payload: &GossipMessage_ConnectPayload{
 			ConnectPayload: &ConnectPayload{
-				NodeId:  gm.localNodeID,
-				Address: gm.localAddress,
-				Version: gm.incrementLocalVersion(),
-				Hlc:     gm.hlc.Now(),
+				NodeId:    gm.localNodeID,
+				Address:   gm.localAddress,
+				Version:   gm.incrementLocalVersion(),
+				Hlc:       gm.hlc.Now(),
+				PublicKey: gm.keypair.Pub, // Include public key for automatic exchange
 			},
 		},
 	}
@@ -453,10 +457,11 @@ func (gm *GossipManager) connectToSeeds() {
 		Sender: gm.localNodeID,
 		Payload: &GossipMessage_ConnectPayload{
 			ConnectPayload: &ConnectPayload{
-				NodeId:  gm.localNodeID,
-				Address: gm.localAddress,
-				Version: gm.incrementLocalVersion(),
-				Hlc:     gm.hlc.Now(),
+				NodeId:    gm.localNodeID,
+				Address:   gm.localAddress,
+				Version:   gm.incrementLocalVersion(),
+				Hlc:       gm.hlc.Now(),
+				PublicKey: gm.keypair.Pub, // Include public key for automatic exchange
 			},
 		},
 	}
@@ -548,6 +553,9 @@ func (gm *GossipManager) GetReplicaStatus() ReplicaStatus {
 	ringMembers := gm.hashRing.Members()
 	logging.Debug("Hash ring members", "count", len(ringMembers), "members", ringMembers)
 
+	// Check public key status
+	pubkeyCount, peerCount, pubkeysReady := gm.HasPublicKeysForPeers()
+
 	return ReplicaStatus{
 		Ready:           ready,
 		ClusterSize:     clusterSize,
@@ -555,7 +563,49 @@ func (gm *GossipManager) GetReplicaStatus() ReplicaStatus {
 		ReplicaFactor:   gm.replicaCount,
 		EffectiveQuorum: effectiveQuorum,
 		LocalNodeID:     gm.localNodeID,
+		PubkeysReady:    pubkeysReady,
+		PubkeyCount:     pubkeyCount,
+		PeerCount:       peerCount,
 	}
+}
+
+// HasPublicKeysForPeers checks if public keys are obtained for all peer nodes.
+// Returns: (keys obtained, total peers, all ready)
+func (gm *GossipManager) HasPublicKeysForPeers() (int, int, bool) {
+	// If authentication is disabled, always return ready
+	if gm.disableAuth {
+		return 0, 0, true
+	}
+
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
+
+	peerCount := 0
+	pubkeyCount := 0
+
+	// Count peer nodes and available public keys
+	for nodeID, node := range gm.liveNodes {
+		// Skip self
+		if nodeID == gm.localNodeID {
+			continue
+		}
+
+		// Only count alive nodes
+		if node.State != NodeState_NODE_STATE_ALIVE {
+			continue
+		}
+
+		peerCount++
+
+		// Check if we have this node's public key
+		if _, ok := gm.peerPubkeys[nodeID]; ok {
+			pubkeyCount++
+		}
+	}
+
+	// System is ready if no peers or all peer keys obtained
+	allReady := (peerCount == 0) || (pubkeyCount >= peerCount)
+	return pubkeyCount, peerCount, allReady
 }
 
 // ReplicaStatus represents the current state of the replica system.
@@ -567,4 +617,8 @@ type ReplicaStatus struct {
 	ReplicaFactor   int
 	EffectiveQuorum int
 	LocalNodeID     string
+	// New fields for public key status
+	PubkeysReady bool // True if all peer public keys are obtained
+	PubkeyCount  int  // Number of peer public keys obtained
+	PeerCount    int  // Total number of peer nodes
 }
