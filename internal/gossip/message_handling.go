@@ -60,6 +60,15 @@ func (gm *GossipManager) handleConnect(msg *GossipMessage) {
 	// Update HLC from remote
 	gm.hlc.Update(p.ConnectPayload.Hlc)
 
+	// Store sender's public key for signature verification
+	// This enables automatic public key exchange during cluster formation
+	if len(p.ConnectPayload.PublicKey) > 0 && p.ConnectPayload.NodeId != "" {
+		gm.mu.Lock()
+		gm.peerPubkeys[p.ConnectPayload.NodeId] = p.ConnectPayload.PublicKey
+		gm.mu.Unlock()
+		logging.Debug("Stored public key for node", "nodeID", p.ConnectPayload.NodeId)
+	}
+
 	// Update node state
 	gm.updateNode(
 		p.ConnectPayload.NodeId,
@@ -67,6 +76,29 @@ func (gm *GossipManager) handleConnect(msg *GossipMessage) {
 		NodeState_NODE_STATE_ALIVE,
 		p.ConnectPayload.Version,
 	)
+
+	// FIX: Send our public key back to the sender
+	// This completes the bidirectional public key exchange
+	if p.ConnectPayload.NodeId != gm.localNodeID {
+		responseMsg := &GossipMessage{
+			Type:   GossipMessageType_MESSAGE_TYPE_CONNECT,
+			Sender: gm.localNodeID,
+			Payload: &GossipMessage_ConnectPayload{
+				ConnectPayload: &ConnectPayload{
+					NodeId:    gm.localNodeID,
+					Address:   gm.localAddress,
+					Version:   gm.incrementLocalVersion(),
+					Hlc:       gm.hlc.Now(),
+					PublicKey: gm.keypair.Pub, // Include our public key
+				},
+			},
+		}
+		gm.signMessageCanonical(responseMsg)
+
+		// Send response back to sender
+		gm.network.SendWithTimeout(p.ConnectPayload.Address, responseMsg, 500*time.Millisecond)
+		logging.Debug("Sent CONNECT response with public key", "target", p.ConnectPayload.NodeId)
+	}
 }
 
 // handleClusterSync processes a CLUSTER_SYNC message containing membership information.
@@ -260,13 +292,15 @@ func (gm *GossipManager) verifyMessageCanonical(msg *GossipMessage) bool {
 		return false
 	}
 
-	// Accept unsigned messages if signing not required (OPTIMIZATION)
-	if msg.Signature == nil {
-		return !gm.requiresSignature(msg)
+	// FIX: If authentication is disabled, accept all messages
+	// This is useful for testing or low-security environments
+	if gm.disableAuth {
+		return true
 	}
 
 	// CRITICAL FIX: For cluster formation messages, accept without signature verification
 	// This enables dynamic cluster formation without pre-shared keys
+	// Check this BEFORE signature verification to allow public key exchange
 	switch msg.Type {
 	case GossipMessageType_MESSAGE_TYPE_CONNECT,
 		GossipMessageType_MESSAGE_TYPE_CLUSTER_SYNC,
@@ -277,7 +311,17 @@ func (gm *GossipManager) verifyMessageCanonical(msg *GossipMessage) bool {
 		return true
 	}
 
+	// Accept unsigned messages if signing not required (OPTIMIZATION)
+	if msg.Signature == nil {
+		return !gm.requiresSignature(msg)
+	}
+
+	// FIX: Check if we have the sender's public key
+	// With automatic public key exchange, this should now work
+	gm.mu.RLock()
 	pub, ok := gm.peerPubkeys[msg.Sender]
+	gm.mu.RUnlock()
+
 	if !ok {
 		logging.Warn("no pubkey for sender, rejecting", "sender", msg.Sender)
 		return false

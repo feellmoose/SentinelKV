@@ -50,6 +50,9 @@ message ConnectPayload {
 
   // Optional HLC timestamp string (format: node:unixnano:counter)
   string hlc = 4;
+
+  // Public key for message signature verification (Ed25519)
+  bytes public_key = 5;
 }
 
 // ClusterSyncPayload contains a list of known nodes for state synchronization.

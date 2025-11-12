@@ -285,7 +285,9 @@ type ConnectPayload struct {
 	Address string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
 	Version int64                  `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`
 	// Optional HLC timestamp string (format: node:unixnano:counter)
-	Hlc           string `protobuf:"bytes,4,opt,name=hlc,proto3" json:"hlc,omitempty"`
+	Hlc string `protobuf:"bytes,4,opt,name=hlc,proto3" json:"hlc,omitempty"`
+	// Public key for message signature verification (Ed25519)
+	PublicKey     []byte `protobuf:"bytes,5,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -346,6 +348,13 @@ func (x *ConnectPayload) GetHlc() string {
 		return x.Hlc
 	}
 	return ""
+}
+
+func (x *ConnectPayload) GetPublicKey() []byte {
+	if x != nil {
+		return x.PublicKey
+	}
+	return nil
 }
 
 // ClusterSyncPayload contains a list of known nodes for state synchronization.
@@ -1467,12 +1476,14 @@ const file_gridkv_gossip_proto_rawDesc = "" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12@\n" +
 	"\x0elast_active_ts\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\flastActiveTs\x12'\n" +
 	"\x05state\x18\x04 \x01(\x0e2\x11.gossip.NodeStateR\x05state\x12\x18\n" +
-	"\aversion\x18\x05 \x01(\x03R\aversion\"o\n" +
+	"\aversion\x18\x05 \x01(\x03R\aversion\"\x8e\x01\n" +
 	"\x0eConnectPayload\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x18\n" +
 	"\aversion\x18\x03 \x01(\x03R\aversion\x12\x10\n" +
-	"\x03hlc\x18\x04 \x01(\tR\x03hlc\"<\n" +
+	"\x03hlc\x18\x04 \x01(\tR\x03hlc\x12\x1d\n" +
+	"\n" +
+	"public_key\x18\x05 \x01(\fR\tpublicKey\"<\n" +
 	"\x12ClusterSyncPayload\x12&\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x10.gossip.NodeInfoR\x05nodes\"W\n" +
 	"\fProbePayload\x12$\n" +

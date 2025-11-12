@@ -326,6 +326,7 @@ func NewGridKV(opts *GridKVOptions) (*GridKV, error) {
 		MaxReplicators:     opts.MaxReplicators,
 		ReplicationTimeout: opts.ReplicationTimeout,
 		ReadTimeout:        opts.ReadTimeout,
+		DisableAuth:        opts.DisableAuth,
 	}
 
 	// Create gossip manager
@@ -647,6 +648,9 @@ func (g *GridKV) GetReplicaStatus() ReplicaStatus {
 			HealthyNodes:  0,
 			ReplicaFactor: 0,
 			LocalNodeID:   "",
+			PubkeysReady:  false,
+			PubkeyCount:   0,
+			PeerCount:     0,
 		}
 	}
 
@@ -659,6 +663,9 @@ func (g *GridKV) GetReplicaStatus() ReplicaStatus {
 		ReplicaFactor:   gmStatus.ReplicaFactor,
 		EffectiveQuorum: gmStatus.EffectiveQuorum,
 		LocalNodeID:     gmStatus.LocalNodeID,
+		PubkeysReady:    gmStatus.PubkeysReady,
+		PubkeyCount:     gmStatus.PubkeyCount,
+		PeerCount:       gmStatus.PeerCount,
 	}
 }
 
@@ -693,19 +700,37 @@ func (g *GridKV) WaitReady(timeout time.Duration) error {
 
 	for time.Now().Before(deadline) {
 		status := g.gm.GetReplicaStatus()
-		if status.Ready {
-			logging.Debug("GridKV replica system ready",
+
+		// Check both node readiness and public key exchange completion
+		if status.Ready && status.PubkeysReady {
+			logging.Debug("GridKV fully ready",
 				"nodes", status.HealthyNodes,
-				"replicaFactor", status.ReplicaFactor)
+				"replicaFactor", status.ReplicaFactor,
+				"pubkeys", status.PubkeyCount,
+				"peers", status.PeerCount)
 			return nil
+		}
+
+		// Provide detailed progress logs
+		if status.Ready && !status.PubkeysReady {
+			logging.Debug("Waiting for public key exchange",
+				"pubkeys", status.PubkeyCount,
+				"peers", status.PeerCount)
 		}
 
 		time.Sleep(checkInterval)
 	}
 
 	status := g.gm.GetReplicaStatus()
-	return fmt.Errorf("timeout waiting for replica system ready: nodes=%d, healthy=%d",
-		status.ClusterSize, status.HealthyNodes)
+
+	// Provide specific error message based on what failed
+	if !status.Ready {
+		return fmt.Errorf("timeout waiting for replica system ready: nodes=%d, healthy=%d",
+			status.ClusterSize, status.HealthyNodes)
+	} else {
+		return fmt.Errorf("timeout waiting for public key exchange: got %d/%d keys",
+			status.PubkeyCount, status.PeerCount)
+	}
 }
 
 // HealthCheck performs a health check on the GridKV instance.
@@ -815,6 +840,9 @@ type ReplicaStatus struct {
 	ReplicaFactor   int    // Configured replication factor (N)
 	EffectiveQuorum int    // Effective write quorum based on available nodes
 	LocalNodeID     string // ID of this node
+	PubkeysReady    bool   // True if all peer public keys are obtained
+	PubkeyCount     int    // Number of peer public keys obtained
+	PeerCount       int    // Total number of peer nodes
 }
 
 // GridKVOptions configures a GridKV instance.
@@ -858,4 +886,5 @@ type GridKVOptions struct {
 	// Security
 	KeyPair        *crypto.KeyPair             // Cryptographic key pair for signing (optional)
 	PeerPublicKeys map[string]crypto.PublicKey // Public keys of peer nodes (optional)
+	DisableAuth    bool                        // Disable message authentication (default: false, use with caution)
 }
