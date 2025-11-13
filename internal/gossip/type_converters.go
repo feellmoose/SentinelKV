@@ -1,71 +1,31 @@
 package gossip
 
 import (
-	"sync"
 	"time"
 
 	"github.com/feellmoose/gridkv/internal/storage"
 )
 
-// Object pools for proto type conversion (OPTIMIZATION: reduces allocations)
-var (
-	// Proto message pools
-	gossipMessagePool = sync.Pool{
-		New: func() interface{} {
-			return &GossipMessage{}
-		},
-	}
-
-	protoItemPool = sync.Pool{
-		New: func() interface{} {
-			return &StoredItem{}
-		},
-	}
-)
-
-// getMessage retrieves a GossipMessage from the pool.
-func getMessage() *GossipMessage {
-	msg := gossipMessagePool.Get().(*GossipMessage)
-	msg.Reset() // Clear previous data
-	return msg
-}
-
-// putMessage returns a GossipMessage to the pool.
-func putMessage(msg *GossipMessage) {
-	if msg != nil {
-		gossipMessagePool.Put(msg)
-	}
-}
-
 // storageItemToProto converts a storage.StoredItem to proto StoredItem.
-// OPTIMIZED: Reuses pooled objects to reduce allocations.
+//
+// NOTE: This function creates a new proto object each time. While object pooling
+// could reduce allocations, protobuf messages have complex lifecycles that make
+// it difficult to safely return objects to a pool without risking memory leaks.
+// The Go GC is efficient enough to handle these allocations.
 //
 // Parameters:
 //   - item: The storage item to convert
 //
 // Returns:
-//   - *StoredItem: Proto representation (from pool)
+//   - *StoredItem: Proto representation
 func storageItemToProto(item *storage.StoredItem) *StoredItem {
 	if item == nil {
 		return nil
 	}
 
-	protoItem := protoItemPool.Get().(*StoredItem)
-	protoItem.ExpireAt = uint64(item.ExpireAt.Unix())
-	protoItem.Value = item.Value
-
-	return protoItem
-}
-
-// returnProtoItemToPool returns a proto item to pool.
-// Call this after the item is no longer needed to avoid memory leaks.
-//
-// Parameters:
-//   - item: The proto item to return to pool
-func returnProtoItemToPool(item *StoredItem) {
-	if item != nil {
-		item.Value = nil // Clear to avoid holding references
-		protoItemPool.Put(item)
+	return &StoredItem{
+		ExpireAt: uint64(item.ExpireAt.Unix()),
+		Value:    item.Value,
 	}
 }
 

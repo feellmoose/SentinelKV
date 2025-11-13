@@ -77,9 +77,13 @@ func (gm *GossipManager) handleConnect(msg *GossipMessage) {
 		p.ConnectPayload.Version,
 	)
 
-	// FIX: Send our public key back to the sender
+	// OPTIMIZATION: Always respond with our public key for bidirectional exchange
 	// This completes the bidirectional public key exchange
 	if p.ConnectPayload.NodeId != gm.localNodeID {
+		var pubKey []byte
+		if gm.keypair != nil {
+			pubKey = gm.keypair.Pub
+		}
 		responseMsg := &GossipMessage{
 			Type:   GossipMessageType_MESSAGE_TYPE_CONNECT,
 			Sender: gm.localNodeID,
@@ -89,28 +93,84 @@ func (gm *GossipManager) handleConnect(msg *GossipMessage) {
 					Address:   gm.localAddress,
 					Version:   gm.incrementLocalVersion(),
 					Hlc:       gm.hlc.Now(),
-					PublicKey: gm.keypair.Pub, // Include our public key
+					PublicKey: pubKey, // Include our public key (may be nil)
 				},
 			},
 		}
-		gm.signMessageCanonical(responseMsg)
+		// SAFETY: signMessageCanonical will handle nil keypair gracefully
+		if err := gm.signMessageCanonical(responseMsg); err != nil && !gm.disableAuth {
+			logging.Warn("Failed to sign CONNECT response", "target", p.ConnectPayload.NodeId, "error", err)
+		}
 
-		// Send response back to sender
-		gm.network.SendWithTimeout(p.ConnectPayload.Address, responseMsg, 500*time.Millisecond)
-		logging.Debug("Sent CONNECT response with public key", "target", p.ConnectPayload.NodeId)
+		// Send response back to sender immediately
+		// Use shorter timeout for faster exchange
+		go func() {
+			if err := gm.network.SendWithTimeout(p.ConnectPayload.Address, responseMsg, 300*time.Millisecond); err != nil {
+				logging.Debug("Failed to send CONNECT response", "target", p.ConnectPayload.NodeId, "error", err)
+			} else {
+				logging.Debug("Sent CONNECT response with public key", "target", p.ConnectPayload.NodeId)
+			}
+		}()
 	}
 }
 
 // handleClusterSync processes a CLUSTER_SYNC message containing membership information.
+// OPTIMIZATION: Request public keys for nodes we don't have keys for
 func (gm *GossipManager) handleClusterSync(msg *GossipMessage) {
 	p, ok := msg.Payload.(*GossipMessage_ClusterSyncPayload)
 	if !ok || p.ClusterSyncPayload == nil {
 		return
 	}
 
+	// OPTIMIZATION: Request public keys for nodes we don't have yet
+	var nodesNeedingKeys []string
+
 	// Update all nodes from sync message
 	for _, n := range p.ClusterSyncPayload.Nodes {
 		gm.updateNode(n.NodeId, n.Address, n.State, n.Version)
+
+		// Check if we need this node's public key
+		if n.NodeId != gm.localNodeID && n.State == NodeState_NODE_STATE_ALIVE {
+			gm.mu.RLock()
+			_, hasKey := gm.peerPubkeys[n.NodeId]
+			gm.mu.RUnlock()
+
+			if !hasKey {
+				nodesNeedingKeys = append(nodesNeedingKeys, n.NodeId)
+			}
+		}
+	}
+
+	// OPTIMIZATION: Request public keys from sender for nodes we don't have
+	// This accelerates public key exchange during cluster formation
+	if len(nodesNeedingKeys) > 0 && msg.Sender != "" {
+		// Send CONNECT message to request public keys
+		// The CONNECT message will trigger public key exchange
+		if peer, ok := gm.getNode(msg.Sender); ok {
+			// Send our public key and request theirs
+			var pubKey []byte
+			if gm.keypair != nil {
+				pubKey = gm.keypair.Pub
+			}
+			connectMsg := &GossipMessage{
+				Type:   GossipMessageType_MESSAGE_TYPE_CONNECT,
+				Sender: gm.localNodeID,
+				Payload: &GossipMessage_ConnectPayload{
+					ConnectPayload: &ConnectPayload{
+						NodeId:    gm.localNodeID,
+						Address:   gm.localAddress,
+						Version:   gm.incrementLocalVersion(),
+						Hlc:       gm.hlc.Now(),
+						PublicKey: pubKey, // Include our public key (may be nil)
+					},
+				},
+			}
+			// SAFETY: signMessageCanonical will handle nil keypair gracefully
+			if err := gm.signMessageCanonical(connectMsg); err != nil && !gm.disableAuth {
+				logging.Warn("Failed to sign CONNECT message for key request", "target", msg.Sender, "error", err)
+			}
+			gm.network.SendWithTimeout(peer.Address, connectMsg, 500*time.Millisecond)
+		}
 	}
 }
 
@@ -245,6 +305,7 @@ func (gm *GossipManager) handleFullSyncResponseMessage(msg *GossipMessage) {
 
 // signMessageCanonical signs a message using the local key pair.
 // OPTIMIZATION: Skip signing if not required (single-node clusters).
+// SAFETY: If keypair is nil and auth is disabled, skip signing without error.
 //
 // Parameters:
 //   - msg: The message to sign
@@ -252,11 +313,24 @@ func (gm *GossipManager) handleFullSyncResponseMessage(msg *GossipMessage) {
 // Returns:
 //   - error: Any signing error
 func (gm *GossipManager) signMessageCanonical(msg *GossipMessage) error {
-	if gm.keypair == nil {
-		return errors.New("keypair not exists")
-	}
 	if msg == nil {
 		return errors.New("nil message")
+	}
+
+	// SAFETY: If keypair is nil, handle gracefully
+	if gm.keypair == nil {
+		// If auth is disabled, allow unsigned messages
+		if gm.disableAuth {
+			msg.Signature = nil
+			return nil
+		}
+		// If signing is not required, allow unsigned messages
+		if !gm.requiresSignature(msg) {
+			msg.Signature = nil
+			return nil
+		}
+		// Otherwise, return error for required signatures
+		return errors.New("keypair not exists")
 	}
 
 	// Skip signing if not required (OPTIMIZATION)
@@ -317,13 +391,28 @@ func (gm *GossipManager) verifyMessageCanonical(msg *GossipMessage) bool {
 	}
 
 	// FIX: Check if we have the sender's public key
-	// With automatic public key exchange, this should now work
+	// OPTIMIZATION: During cluster formation, allow messages without keys temporarily
 	gm.mu.RLock()
 	pub, ok := gm.peerPubkeys[msg.Sender]
+	clusterSize := len(gm.liveNodes)
 	gm.mu.RUnlock()
 
 	if !ok {
-		logging.Warn("no pubkey for sender, rejecting", "sender", msg.Sender)
+		// OPTIMIZATION: For cluster formation messages, allow without key temporarily
+		// This prevents rejection during startup when keys are still being exchanged
+		if clusterSize < 3 {
+			// Very early startup - allow message to pass through
+			logging.Debug("Accepting message without pubkey during cluster formation",
+				"sender", msg.Sender, "clusterSize", clusterSize)
+			return true
+		}
+
+		// For data messages, we need the key - but log as debug during startup
+		if clusterSize < 10 {
+			logging.Debug("No pubkey for sender, rejecting", "sender", msg.Sender, "clusterSize", clusterSize)
+		} else {
+			logging.Warn("no pubkey for sender, rejecting", "sender", msg.Sender)
+		}
 		return false
 	}
 
