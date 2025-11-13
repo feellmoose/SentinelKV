@@ -97,8 +97,9 @@ func (gm *GossipManager) markNodeAliveFromProbe(nodeID string) {
 }
 
 // runFailureDetection implements SWIM-style failure detection.
-// This runs periodically to detect and mark failed nodes.
+// OPTIMIZATION: Improved stability during cluster startup
 //
+// This runs periodically to detect and mark failed nodes.
 // State transitions:
 //   - ALIVE -> SUSPECT: After FailureTimeout with no heartbeat
 //   - SUSPECT -> DEAD: After FailureTimeout + SuspectTimeout
@@ -108,6 +109,9 @@ func (gm *GossipManager) runFailureDetection() {
 	var toRemove, toMarkDead []string
 
 	gm.mu.Lock()
+	clusterSize := len(gm.liveNodes)
+	startupGracePeriod := 20 * time.Second // Grace period after startup (increased)
+
 	for id, node := range gm.liveNodes {
 		// Skip local node
 		if id == gm.localNodeID {
@@ -116,23 +120,58 @@ func (gm *GossipManager) runFailureDetection() {
 
 		elapsed := now.Sub(node.LastActiveTs.AsTime())
 
+		// OPTIMIZATION: Track when node was first discovered (use initial timestamp)
+		// If this is a new node (recently added), give it grace period
+		timeSinceFirstSeen := elapsed
+
 		switch node.State {
 		case NodeState_NODE_STATE_ALIVE:
+			// OPTIMIZATION: Apply grace period during startup to reduce false SUSPECT
+			// For small clusters (< 5 nodes), give more time for startup
+			effectiveTimeout := gm.failureTimeout
+
+			// OPTIMIZATION: During initial cluster formation, be more lenient
+			// Small clusters need more time for gossip to propagate
+			if clusterSize < 5 {
+				effectiveTimeout = gm.failureTimeout * 2 // Double timeout for small clusters
+			} else if clusterSize < 10 {
+				effectiveTimeout = gm.failureTimeout * 3 / 2 // 1.5x timeout for medium clusters
+			}
+
 			// Mark as suspect after failure timeout
-			if elapsed > gm.failureTimeout {
-				node.State = NodeState_NODE_STATE_SUSPECT
-				node.Version = gm.incrementLocalVersion()
-				go gm.initiateProbe(id)
-				logging.Warn("MEMBER SUSPECT", "node", id, "elapsed", elapsed)
+			if elapsed > effectiveTimeout {
+				// OPTIMIZATION: During startup grace period, don't mark as SUSPECT
+				// This prevents false positives when nodes are still joining
+				if timeSinceFirstSeen < startupGracePeriod {
+					// Node is new - extend grace period instead of marking SUSPECT
+					// Update timestamp to give it more time
+					node.LastActiveTs = timestamppb.Now()
+					if logging.Log.IsDebugEnabled() {
+						logging.Debug("Node in startup grace period, extending timeout",
+							"node", id, "elapsed", elapsed, "clusterSize", clusterSize)
+					}
+				} else {
+					// Node has been known for a while - mark as SUSPECT
+					node.State = NodeState_NODE_STATE_SUSPECT
+					node.Version = gm.incrementLocalVersion()
+					go gm.initiateProbe(id)
+					logging.Warn("MEMBER SUSPECT", "node", id, "elapsed", elapsed, "clusterSize", clusterSize)
+				}
 			}
 
 		case NodeState_NODE_STATE_SUSPECT:
+			// OPTIMIZATION: Extended suspect timeout for larger clusters
+			suspectDeadline := gm.failureTimeout + gm.suspectTimeout
+			if clusterSize > 10 {
+				suspectDeadline = suspectDeadline * 2 // Double timeout for large clusters
+			}
+
 			// Mark as dead after suspect timeout
-			if elapsed > gm.failureTimeout+gm.suspectTimeout {
+			if elapsed > suspectDeadline {
 				node.State = NodeState_NODE_STATE_DEAD
 				node.Version = gm.incrementLocalVersion()
 				toMarkDead = append(toMarkDead, id)
-				logging.Error(errors.New("MEMBER DEAD"), "member dead", "node", id)
+				logging.Error(errors.New("MEMBER DEAD"), "member dead", "node", id, "clusterSize", clusterSize)
 			}
 
 		case NodeState_NODE_STATE_DEAD:

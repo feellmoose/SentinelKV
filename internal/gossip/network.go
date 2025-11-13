@@ -253,6 +253,25 @@ func (n *NetworkImpl) Listen(receiver func(msg *GossipMessage) error) error {
 // Stop stops the underlying transport and closes all connection pools.
 func (n *NetworkImpl) Stop() error {
 	n.protocol.Stop()
+
+	// CRITICAL: Clean up pending ACKs to prevent memory leaks
+	// Close all pending channels and remove from map
+	n.pendingAcks.Range(func(key, value interface{}) bool {
+		if ch, ok := value.(chan *CacheSyncAckPayload); ok {
+			// SAFETY: Use recover to handle potential panic when closing channel
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Channel already closed, ignore
+					}
+				}()
+				close(ch)
+			}()
+		}
+		n.pendingAcks.Delete(key)
+		return true
+	})
+
 	return nil
 }
 
@@ -354,16 +373,35 @@ func (n *NetworkImpl) HandleAck(ack *CacheSyncAckPayload) {
 
 	// Look up the pending ACK channel
 	if ch, ok := n.pendingAcks.Load(ack.OpId); ok {
-		// Send the ACK to the waiting goroutine (non-blocking)
-		select {
-		case ch.(chan *CacheSyncAckPayload) <- ack:
-			logging.Debug("ACK delivered", "opId", ack.OpId, "success", ack.Success)
-		default:
-			// Channel full or closed, log warning
-			logging.Warn("Failed to deliver ACK (channel full or closed)", "opId", ack.OpId)
-		}
+		// SAFETY: Use recover to handle potential panic when sending to closed channel
+		// This prevents crashes if the channel was closed due to timeout
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Channel was closed, remove from map and log
+					n.pendingAcks.Delete(ack.OpId)
+					if logging.Log.IsDebugEnabled() {
+						logging.Debug("ACK channel closed (timeout)", "opId", ack.OpId)
+					}
+				}
+			}()
+			// Send the ACK to the waiting goroutine (non-blocking)
+			select {
+			case ch.(chan *CacheSyncAckPayload) <- ack:
+				if logging.Log.IsDebugEnabled() {
+					logging.Debug("ACK delivered", "opId", ack.OpId, "success", ack.Success)
+				}
+			default:
+				// Channel full, log warning
+				if logging.Log.IsDebugEnabled() {
+					logging.Warn("Failed to deliver ACK (channel full)", "opId", ack.OpId)
+				}
+			}
+		}()
 	} else {
 		// No one is waiting for this ACK (may have timed out)
-		logging.Debug("Received ACK for unknown or expired OpId", "opId", ack.OpId)
+		if logging.Log.IsDebugEnabled() {
+			logging.Debug("Received ACK for unknown or expired OpId", "opId", ack.OpId)
+		}
 	}
 }

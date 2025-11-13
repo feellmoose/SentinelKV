@@ -109,6 +109,9 @@ type GossipManager struct {
 
 	// Goroutine pool for replication workers (OPTIMIZATION)
 	replicationPool *ants.Pool
+
+	clusterReady   atomic.Bool  // Cached readiness status
+	lastReadyCheck atomic.Int64 // Last time readiness was checked (Unix nano)
 }
 
 // NewGossipManager creates a new GossipManager instance with the specified configuration.
@@ -144,13 +147,13 @@ func NewGossipManager(opts *GossipOptions, hashRing *ConsistentHash, network Net
 
 	// Set defaults for optional parameters
 	if opts.FailureTimeout == 0 {
-		opts.FailureTimeout = 5 * time.Second
+		opts.FailureTimeout = 15 * time.Second // Increased from 5s to handle slow startup
 	}
 	if opts.SuspectTimeout == 0 {
-		opts.SuspectTimeout = 10 * time.Second
+		opts.SuspectTimeout = 30 * time.Second // Increased from 10s for larger clusters
 	}
 	if opts.GossipInterval == 0 {
-		opts.GossipInterval = 1 * time.Second
+		opts.GossipInterval = 500 * time.Millisecond // Faster gossip for quicker convergence
 	}
 	if opts.ReplicaCount <= 0 {
 		opts.ReplicaCount = 3
@@ -212,6 +215,9 @@ func NewGossipManager(opts *GossipOptions, hashRing *ConsistentHash, network Net
 	// CRITICAL: Add local node to hash ring during initialization
 	hashRing.Add(gm.localNodeID)
 
+	gm.clusterReady.Store(true)
+	gm.lastReadyCheck.Store(time.Now().UnixNano())
+
 	// Initialize adaptive batching
 	gm.lastBatchSize.Store(100) // Start with default batch size
 	gm.lastRateCheck.Store(time.Now().Unix())
@@ -249,6 +255,10 @@ func (gm *GossipManager) Start() {
 	logging.Debug("Gossip Manager started", "node", gm.localNodeID)
 
 	// Send initial CONNECT message to announce presence
+	var pubKey []byte
+	if gm.keypair != nil {
+		pubKey = gm.keypair.Pub
+	}
 	join := &GossipMessage{
 		Type:   GossipMessageType_MESSAGE_TYPE_CONNECT,
 		Sender: gm.localNodeID,
@@ -258,11 +268,14 @@ func (gm *GossipManager) Start() {
 				Address:   gm.localAddress,
 				Version:   gm.incrementLocalVersion(),
 				Hlc:       gm.hlc.Now(),
-				PublicKey: gm.keypair.Pub, // Include public key for automatic exchange
+				PublicKey: pubKey, // Include public key for automatic exchange (may be nil)
 			},
 		},
 	}
-	gm.signMessageCanonical(join)
+	// SAFETY: signMessageCanonical will handle nil keypair gracefully
+	if err := gm.signMessageCanonical(join); err != nil && !gm.disableAuth {
+		logging.Warn("Failed to sign CONNECT message", "error", err)
+	}
 	gm.SimulateReceive(join)
 
 	// CRITICAL FIX: Connect to seed nodes on startup
@@ -280,6 +293,24 @@ func (gm *GossipManager) Stop() {
 	if gm.replicationPool != nil {
 		gm.replicationPool.Release()
 	}
+
+	// CRITICAL: Clean up pending reads to prevent memory leaks
+	// Close all pending channels and remove from map
+	gm.pendingReads.Range(func(key, value interface{}) bool {
+		if ch, ok := value.(chan *ReadResponsePayload); ok {
+			// SAFETY: Use recover to handle potential panic when closing channel
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Channel already closed, ignore
+					}
+				}()
+				close(ch)
+			}()
+		}
+		gm.pendingReads.Delete(key)
+		return true
+	})
 
 	logging.Debug("Gossip Manager stopped", "node", gm.localNodeID)
 }
@@ -440,8 +471,8 @@ func (gm *GossipManager) getRandomPeerID(exclude string) string {
 }
 
 // connectToSeeds initiates connections to all seed nodes on startup.
-// This is critical for cluster formation and node discovery.
 //
+// This is critical for cluster formation and node discovery.
 // The function sends CONNECT messages to all seed addresses to announce
 // this node's presence and trigger mutual discovery. It retries periodically
 // until at least one seed responds or the cluster is formed.
@@ -452,6 +483,10 @@ func (gm *GossipManager) connectToSeeds() {
 	}
 
 	// Prepare CONNECT message
+	var pubKey []byte
+	if gm.keypair != nil {
+		pubKey = gm.keypair.Pub
+	}
 	connectMsg := &GossipMessage{
 		Type:   GossipMessageType_MESSAGE_TYPE_CONNECT,
 		Sender: gm.localNodeID,
@@ -461,15 +496,40 @@ func (gm *GossipManager) connectToSeeds() {
 				Address:   gm.localAddress,
 				Version:   gm.incrementLocalVersion(),
 				Hlc:       gm.hlc.Now(),
-				PublicKey: gm.keypair.Pub, // Include public key for automatic exchange
+				PublicKey: pubKey, // Include public key for automatic exchange (may be nil)
 			},
 		},
 	}
-	gm.signMessageCanonical(connectMsg)
+	// SAFETY: signMessageCanonical will handle nil keypair gracefully
+	if err := gm.signMessageCanonical(connectMsg); err != nil && !gm.disableAuth {
+		logging.Warn("Failed to sign CONNECT message to seed", "error", err)
+	}
 
-	// Retry connecting to seeds with exponential backoff
-	maxRetries := 10
-	retryDelay := 100 * time.Millisecond
+	logging.Debug("Connecting to seed nodes", "seeds", len(gm.seedAddrs))
+
+	// Send initial CONNECT to all seeds immediately
+	var wg sync.WaitGroup
+	for _, seedAddr := range gm.seedAddrs {
+		// Skip if seed address is our own address
+		if seedAddr == gm.localAddress {
+			continue
+		}
+
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			// Use shorter timeout for faster failure detection
+			if err := gm.network.SendWithTimeout(addr, connectMsg, 1*time.Second); err != nil {
+				logging.Debug("Failed to connect to seed", "seed", addr, "error", err)
+			} else {
+				logging.Debug("Sent CONNECT to seed", "seed", addr)
+			}
+		}(seedAddr)
+	}
+	wg.Wait()
+
+	maxRetries := 5                     // Reduced from 10
+	retryDelay := 50 * time.Millisecond // Reduced from 100ms
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Check if we've discovered any peers
@@ -482,27 +542,20 @@ func (gm *GossipManager) connectToSeeds() {
 			return
 		}
 
-		// Try to connect to all seeds
-		logging.Debug("Connecting to seed nodes", "attempt", attempt+1, "seeds", len(gm.seedAddrs))
+		// Wait briefly before retry
+		time.Sleep(retryDelay)
+		retryDelay = retryDelay * 2
+		if retryDelay > 1*time.Second {
+			retryDelay = 1 * time.Second // Cap at 1s instead of 5s
+		}
+
+		// Retry failed connections
 		for _, seedAddr := range gm.seedAddrs {
-			// Skip if seed address is our own address
 			if seedAddr == gm.localAddress {
 				continue
 			}
-
-			// Send CONNECT message to seed
-			if err := gm.network.SendWithTimeout(seedAddr, connectMsg, 2*time.Second); err != nil {
-				logging.Debug("Failed to connect to seed", "seed", seedAddr, "error", err)
-			} else {
-				logging.Debug("Sent CONNECT to seed", "seed", seedAddr)
-			}
-		}
-
-		// Wait before retry with exponential backoff
-		time.Sleep(retryDelay)
-		retryDelay = retryDelay * 2
-		if retryDelay > 5*time.Second {
-			retryDelay = 5 * time.Second
+			// Quick retry
+			gm.network.SendWithTimeout(seedAddr, connectMsg, 500*time.Millisecond)
 		}
 	}
 
@@ -518,6 +571,40 @@ func (gm *GossipManager) connectToSeeds() {
 	}
 }
 
+// IsReady performs a fast readiness check using cached atomic status.
+//
+// Returns:
+//   - bool: true if cluster is ready, false otherwise
+func (gm *GossipManager) IsReady() bool {
+	// OPTIMIZATION: Use cached atomic status (no lock needed)
+	// Cache is updated periodically by GetReplicaStatus()
+	const cacheTTL = 100 * time.Millisecond
+	now := time.Now().UnixNano()
+	lastCheck := gm.lastReadyCheck.Load()
+
+	// If cache is fresh, use it
+	if now-lastCheck < int64(cacheTTL) {
+		return gm.clusterReady.Load()
+	}
+
+	// Cache expired - do quick check
+	gm.mu.RLock()
+	healthyNodes := 0
+	for _, node := range gm.liveNodes {
+		if node.State == NodeState_NODE_STATE_ALIVE {
+			healthyNodes++
+		}
+	}
+	ready := healthyNodes > 0
+	gm.mu.RUnlock()
+
+	// Update cache
+	gm.clusterReady.Store(ready)
+	gm.lastReadyCheck.Store(now)
+
+	return ready
+}
+
 // GetReplicaStatus returns the current state of the replica system.
 // This provides visibility into cluster health and formation status.
 //
@@ -525,8 +612,6 @@ func (gm *GossipManager) connectToSeeds() {
 //   - ReplicaStatus: Current cluster state
 func (gm *GossipManager) GetReplicaStatus() ReplicaStatus {
 	gm.mu.RLock()
-	defer gm.mu.RUnlock()
-
 	clusterSize := len(gm.liveNodes)
 	healthyNodes := 0
 
@@ -548,13 +633,21 @@ func (gm *GossipManager) GetReplicaStatus() ReplicaStatus {
 
 	// System is ready if at least one node is available
 	ready := healthyNodes > 0
+	gm.mu.RUnlock()
 
-	// DEBUG: Log hash ring members
-	ringMembers := gm.hashRing.Members()
-	logging.Debug("Hash ring members", "count", len(ringMembers), "members", ringMembers)
+	gm.clusterReady.Store(ready)
+	gm.lastReadyCheck.Store(time.Now().UnixNano())
 
-	// Check public key status
+	// Check public key status (needs lock)
+	gm.mu.RLock()
 	pubkeyCount, peerCount, pubkeysReady := gm.HasPublicKeysForPeers()
+	gm.mu.RUnlock()
+
+	// Only log if debug is enabled
+	if logging.Log.IsDebugEnabled() {
+		ringMembers := gm.hashRing.Members()
+		logging.Debug("Hash ring members", "count", len(ringMembers), "members", ringMembers)
+	}
 
 	return ReplicaStatus{
 		Ready:           ready,

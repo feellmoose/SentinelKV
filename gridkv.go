@@ -373,6 +373,7 @@ func NewGridKV(opts *GridKVOptions) (*GridKV, error) {
 //   - ctx: Context for cancellation/timeout (recommended: 5s timeout for WAN)
 //   - key: Key to store (non-empty, max recommended: 256 bytes)
 //   - value: Data to store (deep-copied, max recommended: 1MB for performance)
+//   - ttl: Optional TTL for this key (overrides default TTL, 0 = no expiration)
 //
 // Returns:
 //   - error: nil on quorum success, error on failure
@@ -393,21 +394,48 @@ func NewGridKV(opts *GridKVOptions) (*GridKV, error) {
 //   - With W=N: Strongest consistency (all nodes must succeed)
 //   - With W=1: Fastest writes (eventual consistency)
 //
-// Example (Session Storage):
+// Example (Session Storage with custom TTL):
 //
 //	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 //	defer cancel()
 //
 //	sessionData := []byte(`{"userID": 123, "role": "admin"}`)
-//	err := kv.Set(ctx, "session:user-12345", sessionData)
+//	// Store with 30 minute TTL (overrides default TTL)
+//	err := kv.Set(ctx, "session:user-12345", sessionData, 30*time.Minute)
 //	if err != nil {
 //	    log.Printf("Failed to store session: %v", err)
 //	    return err
 //	}
 //
+// Example (Using default TTL):
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//	defer cancel()
+//
+//	data := []byte("value")
+//	// Uses default TTL from GridKVOptions
+//	err := kv.Set(ctx, "key", data)
+//	if err != nil {
+//	    log.Printf("Failed to store: %v", err)
+//	    return err
+//	}
+//
+// Example (Explicitly disable TTL):
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//	defer cancel()
+//
+//	permanentData := []byte("permanent value")
+//	// Explicitly disable TTL (overrides default TTL)
+//	err := kv.Set(ctx, "permanent:key", permanentData, 0)
+//	if err != nil {
+//	    log.Printf("Failed to store: %v", err)
+//	    return err
+//	}
+//
 // Panic safety: Recovers from internal panics and returns error.
 // Thread-safety: Safe to call concurrently from multiple goroutines.
-func (g *GridKV) Set(ctx context.Context, key string, value []byte) (err error) {
+func (g *GridKV) Set(ctx context.Context, key string, value []byte, ttl ...time.Duration) (err error) {
 	// SAFETY: Recover from panics to prevent application crash
 	var item *storage.StoredItem
 	defer func() {
@@ -428,16 +456,40 @@ func (g *GridKV) Set(ctx context.Context, key string, value []byte) (err error) 
 		return errors.New("key cannot be empty")
 	}
 
+	// OPTIMIZATION: Fast path readiness check using atomic variable (no lock)
+	// This prevents data loss during startup when cluster is not fully stable
+	// Use lightweight IsReady() check first, only do full check if needed
+	if !g.gm.IsReady() {
+		// Cluster not ready - do full check for detailed error message
+		status := g.GetReplicaStatus()
+		if !status.Ready {
+			return fmt.Errorf("cluster not ready: cannot Set key %s (nodes: %d, healthy: %d)",
+				key, status.ClusterSize, status.HealthyNodes)
+		}
+	}
+
 	// Create StoredItem with TTL
 	// OPTIMIZATION: Use object pool to reduce allocations
 	item = storage.GetStoredItem()
 	item.Value = value
 	item.Version = time.Now().UnixNano() // Use timestamp as version
 
-	if g.ttl > 0 {
-		item.ExpireAt = time.Now().Add(g.ttl)
+	// Determine TTL: use provided TTL if available, otherwise use default
+	// If ttl is provided (even if 0), it overrides the default TTL
+	if len(ttl) > 0 {
+		// TTL provided: use it (0 means no expiration, overriding default)
+		if ttl[0] > 0 {
+			item.ExpireAt = time.Now().Add(ttl[0])
+		} else {
+			item.ExpireAt = time.Time{} // No expiration (explicit override)
+		}
 	} else {
-		item.ExpireAt = time.Time{} // No expiration (zero value)
+		// No TTL provided: use default TTL from options
+		if g.ttl > 0 {
+			item.ExpireAt = time.Now().Add(g.ttl)
+		} else {
+			item.ExpireAt = time.Time{} // No expiration (zero value)
+		}
 	}
 
 	// Delegate to gossip manager for distributed write
@@ -529,6 +581,9 @@ func (g *GridKV) Get(ctx context.Context, key string) (value []byte, err error) 
 	if key == "" {
 		return nil, errors.New("key cannot be empty")
 	}
+
+	// OPTIMIZATION: Get operation doesn't need readiness check
+	// readWithQuorum handles local-only reads gracefully during startup
 
 	// Delegate to gossip manager for distributed read
 	item, err = g.gm.Get(ctx, key)
@@ -670,10 +725,13 @@ func (g *GridKV) GetReplicaStatus() ReplicaStatus {
 }
 
 // WaitReady blocks until the replica system is ready or timeout occurs.
+// OPTIMIZATION: Added stability check to ensure cluster is fully stabilized
 //
 // The system is considered ready when:
 //   - At least one node is in the hash ring (can serve requests)
 //   - The local node has joined the cluster
+//   - All peer public keys are exchanged (if auth enabled)
+//   - Cluster has been stable for a grace period (NEW)
 //
 // Parameters:
 //   - timeout: Maximum time to wait for readiness
@@ -687,7 +745,7 @@ func (g *GridKV) GetReplicaStatus() ReplicaStatus {
 //	if err := kv.WaitReady(30 * time.Second); err != nil {
 //	    log.Fatalf("Cluster not ready: %v", err)
 //	}
-//	// Now safe to use Set/Get/Delete
+//	// Now safe to use Set/Get/Delete - cluster is fully stable
 //
 // Thread-safety: Safe to call concurrently.
 func (g *GridKV) WaitReady(timeout time.Duration) error {
@@ -697,39 +755,80 @@ func (g *GridKV) WaitReady(timeout time.Duration) error {
 
 	deadline := time.Now().Add(timeout)
 	checkInterval := 100 * time.Millisecond
+	stabilityGracePeriod := 500 * time.Millisecond // Stability check period
+	var firstReadyTime *time.Time
+	var lastClusterSize, lastHealthyNodes, lastPubkeyCount int
 
 	for time.Now().Before(deadline) {
-		status := g.gm.GetReplicaStatus()
+		status := g.GetReplicaStatus()
 
-		// Check both node readiness and public key exchange completion
-		if status.Ready && status.PubkeysReady {
-			logging.Debug("GridKV fully ready",
-				"nodes", status.HealthyNodes,
-				"replicaFactor", status.ReplicaFactor,
-				"pubkeys", status.PubkeyCount,
-				"peers", status.PeerCount)
-			return nil
-		}
+		// Check if system meets readiness criteria
+		isReady := status.Ready && status.PubkeysReady && status.HealthyNodes > 0
 
-		// Provide detailed progress logs
-		if status.Ready && !status.PubkeysReady {
-			logging.Debug("Waiting for public key exchange",
-				"pubkeys", status.PubkeyCount,
-				"peers", status.PeerCount)
+		if isReady {
+			// OPTIMIZATION: Stability check - ensure status doesn't change
+			if firstReadyTime == nil {
+				// First time we're ready - record timestamp
+				now := time.Now()
+				firstReadyTime = &now
+				lastClusterSize = status.ClusterSize
+				lastHealthyNodes = status.HealthyNodes
+				lastPubkeyCount = status.PubkeyCount
+			} else {
+				// Check if status has been stable
+				stableDuration := time.Since(*firstReadyTime)
+
+				// If status changed, reset stability check
+				if status.ClusterSize != lastClusterSize ||
+					status.HealthyNodes != lastHealthyNodes ||
+					status.PubkeyCount != lastPubkeyCount {
+					now := time.Now()
+					firstReadyTime = &now
+					lastClusterSize = status.ClusterSize
+					lastHealthyNodes = status.HealthyNodes
+					lastPubkeyCount = status.PubkeyCount
+				} else if stableDuration >= stabilityGracePeriod {
+					// System has been stable for grace period - ready!
+					logging.Info("GridKV fully ready and stable",
+						"nodes", status.HealthyNodes,
+						"clusterSize", status.ClusterSize,
+						"replicaFactor", status.ReplicaFactor,
+						"pubkeys", status.PubkeyCount,
+						"peers", status.PeerCount)
+					return nil
+				}
+			}
+		} else {
+			// Not ready yet - reset stability check
+			firstReadyTime = nil
+
+			// Provide detailed progress logs
+			if status.Ready && !status.PubkeysReady {
+				logging.Debug("Waiting for public key exchange",
+					"pubkeys", status.PubkeyCount,
+					"peers", status.PeerCount)
+			} else if !status.Ready {
+				logging.Debug("Waiting for cluster formation",
+					"nodes", status.ClusterSize,
+					"healthy", status.HealthyNodes)
+			}
 		}
 
 		time.Sleep(checkInterval)
 	}
 
-	status := g.gm.GetReplicaStatus()
+	// Timeout reached - check final status
+	status := g.GetReplicaStatus()
 
 	// Provide specific error message based on what failed
 	if !status.Ready {
-		return fmt.Errorf("timeout waiting for replica system ready: nodes=%d, healthy=%d",
-			status.ClusterSize, status.HealthyNodes)
-	} else {
+		return fmt.Errorf("timeout waiting for replica system ready: nodes=%d, healthy=%d, clusterSize=%d",
+			status.ClusterSize, status.HealthyNodes, status.ClusterSize)
+	} else if !status.PubkeysReady {
 		return fmt.Errorf("timeout waiting for public key exchange: got %d/%d keys",
 			status.PubkeyCount, status.PeerCount)
+	} else {
+		return fmt.Errorf("timeout waiting for cluster stability: cluster may still be converging")
 	}
 }
 
@@ -873,9 +972,10 @@ type GridKVOptions struct {
 	ReadTimeout        time.Duration // Timeout for read operations (default: 2s)
 
 	// Failure Detection
-	FailureTimeout time.Duration // Timeout before marking node as suspect (default: 5s)
-	SuspectTimeout time.Duration // Timeout before marking suspect node as dead (default: 10s)
-	GossipInterval time.Duration // Interval for gossip protocol (default: 1s, LAN) or (4s, WAN)
+	// OPTIMIZATION: Increased timeouts to reduce false positives during cluster formation
+	FailureTimeout time.Duration // Timeout before marking node as suspect (default: 15s, increased from 5s)
+	SuspectTimeout time.Duration // Timeout before marking suspect node as dead (default: 30s, increased from 10s)
+	GossipInterval time.Duration // Interval for gossip protocol (default: 500ms, faster convergence)
 
 	// Multi-Datacenter
 	DataCenter string // Datacenter identifier for topology-aware operations (optional)

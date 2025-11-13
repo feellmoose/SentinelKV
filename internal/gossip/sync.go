@@ -3,6 +3,7 @@ package gossip
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ var (
 )
 
 // gossipPeriodically broadcasts cluster membership to a random peer.
+//
 // This is the core of the gossip protocol for membership dissemination.
 func (gm *GossipManager) gossipPeriodically() {
 	// Fast path: skip if no peers (OPTIMIZATION)
@@ -32,7 +34,7 @@ func (gm *GossipManager) gossipPeriodically() {
 		return // No peers to gossip with
 	}
 
-	// Use pooled slice for members (OPTIMIZATION)
+	// OPTIMIZATION: During startup, gossip to multiple peers for faster convergence
 	gm.mu.RLock()
 	membersPtr := nodeInfoSlicePool.Get().(*[]*NodeInfo)
 	members := (*membersPtr)[:0] // Reset to zero length
@@ -47,33 +49,88 @@ func (gm *GossipManager) gossipPeriodically() {
 			Version:      n.Version,
 		})
 	}
-	target := gm.getRandomPeerID("")
 	gm.mu.RUnlock()
 
-	if target == "" {
-		nodeInfoSlicePool.Put(membersPtr)
-		return
-	}
+	// OPTIMIZATION: For small clusters, gossip to multiple peers simultaneously
+	// This accelerates cluster convergence during startup
+	gossipTargets := gm.getGossipTargets(peerCount)
 
-	// Create cluster sync message
-	sync := &GossipMessage{
+	// Create cluster sync message once (shared for all targets)
+	syncMsg := &GossipMessage{
 		Type:   CLUSTER_SYNC,
 		Sender: gm.localNodeID,
 		Payload: &GossipMessage_ClusterSyncPayload{
 			ClusterSyncPayload: &ClusterSyncPayload{Nodes: members},
 		},
 	}
-	gm.signMessageCanonical(sync)
+	gm.signMessageCanonical(syncMsg)
 
-	if peer, ok := gm.getNode(target); ok {
-		gm.network.SendWithTimeout(peer.Address, sync, 500*time.Millisecond)
+	// Send to all targets (parallel for faster convergence)
+	var wg sync.WaitGroup
+	for _, target := range gossipTargets {
+		target := target // Capture loop variable
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			if peer, ok := gm.getNode(t); ok {
+				// Use shorter timeout for faster gossip
+				gm.network.SendWithTimeout(peer.Address, syncMsg, 300*time.Millisecond)
+			}
+		}(target)
 	}
+	wg.Wait()
 
 	// Return pooled slice
 	nodeInfoSlicePool.Put(membersPtr)
 
-	// Batch cache gossip with cluster gossip to same target (OPTIMIZATION)
-	gm.gossipCachePeriodically(target)
+	// Batch cache gossip with cluster gossip to first target (OPTIMIZATION)
+	if len(gossipTargets) > 0 {
+		gm.gossipCachePeriodically(gossipTargets[0])
+	}
+}
+
+// getGossipTargets returns targets for gossip based on cluster size.
+// OPTIMIZATION: For small clusters, gossip to multiple peers for faster convergence.
+func (gm *GossipManager) getGossipTargets(peerCount int) []string {
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
+
+	var targets []string
+
+	if peerCount <= 3 {
+		// Small cluster: gossip to all peers for fastest convergence
+		for id := range gm.liveNodes {
+			if id != gm.localNodeID {
+				targets = append(targets, id)
+			}
+		}
+	} else if peerCount <= 10 {
+		// Medium cluster: gossip to 2-3 random peers
+		count := 3
+		if peerCount < 5 {
+			count = 2
+		}
+		ids := make([]string, 0, len(gm.liveNodes))
+		for id := range gm.liveNodes {
+			if id != gm.localNodeID {
+				ids = append(ids, id)
+			}
+		}
+		// Select random peers
+		for i := 0; i < count && i < len(ids); i++ {
+			idx := rand.Intn(len(ids) - i)
+			targets = append(targets, ids[idx])
+			ids[idx], ids[len(ids)-1-i] = ids[len(ids)-1-i], ids[idx]
+		}
+	} else {
+		// Large cluster: gossip to 1 random peer (standard gossip)
+		target := gm.getRandomPeerID("")
+		if target != "" {
+			targets = append(targets, target)
+		}
+	}
+
+	return targets
 }
 
 // gossipCachePeriodically broadcasts incremental cache updates to a target node.
